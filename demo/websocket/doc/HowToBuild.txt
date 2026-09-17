@@ -1,0 +1,13 @@
+1. go into path [HD900\src\alg\demo\websocket]
+
+2. make menu
+
+3. copy websocket_demo and to device and run it.
+
+4. use web browser to open the file named test.html
+
+5. click "connect" button
+
+6. send message: get_warning
+
+

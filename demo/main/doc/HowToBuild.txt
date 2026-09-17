@@ -1,0 +1,9 @@
+1. go into path [HD900\src\alg\demo\main]
+
+2. make menu
+
+3. copy all files in 'install' to your RK board
+
+4. run 'run_rv1109_rv1126.sh' on board
+
+note: before run main_demo, please kill  wtd.sh , ipsys and alg firstly and then rerun ipsys.

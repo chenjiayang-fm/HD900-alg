@@ -1,0 +1,11 @@
+1. go into path [rknpu\examples\rknn_yolov5_demo]
+
+2. change the ARM toolchain path in file [build.sh]£º
+
+     RV1109_TOOL_CHAIN=(your local tool chain path)
+
+3. run 'build.sh' to compile the demo
+
+4. copy all files in 'install' to your RK board
+
+5. run 'run_rv1109_rv1126.sh' on board

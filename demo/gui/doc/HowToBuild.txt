@@ -1,0 +1,7 @@
+1. go into path [HD900\src\alg\demo\media]
+
+2. make menu
+
+3. copy gui_demo to device and run it.
+
+note: before run media_demo, please kill  wtd.sh , ipsys and alg firstly and then rerun ipsys.

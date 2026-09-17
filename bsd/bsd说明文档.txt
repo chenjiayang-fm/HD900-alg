@@ -1,0 +1,11 @@
+BSD算法程序说明
+在16E平台上运行BSD算法程序时，
+1. 需要将图片库overtake.tar.gz拷贝到平台的/root路径下
+2. 同时需要将HD900/lib/../osd路径下动态库
+	libbsd.so, libopencv_core.so, libopencv_features2d.so,
+	libopencv_flann.so, libopencv_highgui.so, libopencv_imgcodecs.so, 
+	libopencv_imgproc.so, libopencv_ml.so, libopencv_video.so, 
+	libopencv_videoio.so
+	拷贝到平台的/usr/lib路径下
+3. 使用以下命令运行bsd程序，并配置敏感度为8
+	./bsd 8

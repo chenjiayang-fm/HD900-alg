@@ -1,0 +1,36 @@
+# Object files and local build by-products
+*.o
+*.obj
+*.d
+*.log
+*.rej
+*.includecache
+progress.marks
+make_log.txt
+.stamp_*
+
+# In-source CMake output
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+/rkmedia/**/Makefile
+
+# Locally built executables and libraries
+/alg
+/alg_testv1
+/alg_testv2
+/test264
+/bsd/bsd
+/upgrade/upgrade
+/pd/libalg_pd.a
+
+# Generated deployment bundles
+/upgrade/upgradefile/
+/rkmedia/rkmedia.tar
+
+# Editor metadata
+.vscode/
+.vsbuild/
+*~

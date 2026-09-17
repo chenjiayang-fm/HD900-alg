@@ -1,0 +1,9 @@
+
+TARGET_LIB  = libbsd.a
+
+include ../../Makefile.param
+
+CPPFLAGS = $(CFLAGS)
+_TARGET_DIR_ = $(TOP_LIB)
+
+include $(AUTO_DEP_MK) 

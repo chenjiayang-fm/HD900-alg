@@ -1,0 +1,94 @@
+#
+# Link all library, and build the final excutable file
+#
+
+include ../../Makefile.param
+
+ifneq ($(PLATFORM),$(findstring $(PLATFORM),RV1126,RV1106))
+IGNORE_THIS_BUILD = alg
+endif
+
+ifeq ($(BOARD),$(findstring $(BOARD),DMS31V2,DMS31SDK))
+SRCPPS = $(wildcard ./dmm/*.cpp)
+SV_COM_LIBS = -ldmm
+endif
+ifeq ($(BOARD),$(findstring $(BOARD),ADA32V2,ADA32SDK,ADA32N1,ADA32C4))
+SRCPPS = $(wildcard ./pd/*.cpp)
+SV_COM_LIBS = -lpds_general_rv1126  -lcalibrate_radar -ljpeg -L../../lib/ada32v2/ 
+endif
+ifeq ($(BOARD), ADA32V3)
+SRCPPS = $(wildcard ./pd/*.cpp)
+SV_COM_LIBS = -lpds_general_rv1106 -ljpeg
+endif
+ifeq ($(BOARD), ADA32IR)
+SRCPPS = $(wildcard ./pd/*.cpp)
+SV_COM_LIBS = -lpds_general_rv1126 -lcalibrate_radar -ljpeg
+endif
+ifeq ($(BOARD), ADA42V1)
+SRCPPS = $(wildcard ./pd/*.cpp)
+SRCPPS += $(wildcard ./dmm/*.cpp)
+SRCPPS += $(wildcard ./adas/*.cpp)
+SV_COM_LIBS = -lpds_general_rv1126 -lcalibrate_radar -ljpeg -ldmm -lLANE -lLANEPROCESS 
+endif
+ifeq ($(BOARD), ADA42PTZV1)
+SRCPPS = $(wildcard ./pd/*.cpp)
+SRCPPS += $(wildcard ./dmm/*.cpp)
+SRCPPS += $(wildcard ./adas/*.cpp)
+SRCPPS += $(wildcard ./track/*.cpp)
+SV_COM_LIBS = -lpds_general_rv1126 -lcalibrate_radar -ljpeg -ldmm -lLANE -lLANEPROCESS -ltrack
+endif
+ifeq ($(BOARD), ADA47V1)
+SRCPPS = $(wildcard ./dmm/*.cpp)
+SRCPPS += $(wildcard ./pd/*.cpp)
+SRCPPS += $(wildcard ./apc/*.cpp)
+SV_COM_LIBS = -ldmm -lpds_general_rv1126 -lcalibrate_radar -ljpeg
+endif
+ifeq ($(BOARD), ADA900V1)
+SRCPPS = $(wildcard ./apc/*.cpp)
+SV_COM_LIBS = -lpds_general_rv1126 -ljpeg
+endif
+ifeq ($(BOARD), HDW845V1)
+SRCPPS = $(wildcard ./zoom/*.cpp)
+SV_COM_LIBS =-lpds_general_rv1126 -lcalibrate_radar -ljpeg
+endif
+
+SRCPPS += alg.cpp
+# Link SV Common library
+SV_COM_LIBS +=  -lalarm -lcjson -lsharefifo -llog -lstorage -lmsg -lcjson -lutils -lboard -lconfig -lmxml -luuid -lsafefunc -lthpool 
+
+################## optional library ######################
+ifneq ($(findstring -DMAKE_LED,$(CFLAGS) $(CPPFLAGS)), )
+SV_COM_LIBS += -lled
+endif
+
+##########################################################
+
+# Link other SV libs
+OTHER_SV_LIBS	= -lrknn_api -lrga -lrockchip_mpp
+
+ifneq ($(BOARD), ADA32V3)
+OTHER_SV_LIBS	+=  -lv4l2 -lv4lconvert -ldrm
+endif
+
+SYSTEM_LIB	= -lssl -lcrypto -ldl -lrt -lpthread -lm -lstdc++ -lz\
+              -leasymedia -ldrm -lrockchip_mpp -lavformat -lavcodec -lswresample -lavutil \
+			  -lliveMedia -lgroupsock -lBasicUsageEnvironment -lUsageEnvironment -lpthread \
+			  -lasound -lRKAP_3A -lRKAP_ANR -lRKAP_Common -lrga \
+			  -lsqlite3 -lmd_share -lod_share -lrkaiq -lssl -lcrypto -lz \
+			  -lv4l2 -lv4lconvert \
+			  -Wl,--as-needed
+
+CFLAGS += -I$(INC_PATH)/libdrm -I$(INC_PATH)/libdrm/drm -I./include -I./include/rknn -I./include/ncnn -I$(INC_PATH)/cjson\
+		  -I$(INC_PATH)/jpeg -I../media/include
+CPPFLAGS = $(CFLAGS)
+
+TARGET_BIN	= alg
+COPY_TO_DIR = $(ROOT_PATH)
+
+LIB_DEPEND	= $(COMP_DEPEND)
+LD_FLAGS	+= -L$(LIB_PATH) -L$(TOP_LIB) 
+LD_FLAGS	+= $(SV_COM_LIBS) $(OTHER_SV_LIBS) $(SYSTEM_LIB)
+
+include $(BIN_AUTO_DEP_MK)
+
+# vim:noet:sw=4:ts=4
