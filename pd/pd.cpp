@@ -70,6 +70,8 @@ Copyright (C) 2021-2023 广州敏视数码科技有限公司版权所有.
 #include <sys/poll.h>
 
 #include "../include/itc.h"
+#include "../include/OpticalFlowCommon.h"
+#include "../include/OpticalFlowAnalyzer.h"
 //#include"../include/mpp_vdec_link.h"
 
 //#include "../../media/include/mpp_vdec.h"
@@ -120,7 +122,12 @@ Copyright (C) 2021-2023 广州敏视数码科技有限公司版权所有.
 #define PD_MODEL_RGB_SSR    "/root/model/RGB_SSR.rknn"              /* 201338 客户检测限速标志*/
 #define PD_MODEL_TRAFFIC    "/root/model/TRAFFIC.rknn"              /* 交通灯模型*/
 #define PD_MODEL_RGB_PC_202406 "/root/model/RGB_PC_202406.rknn"     /* 202406 客户模型 */
-#define PD_MODEL_RGB_TEST      "/root/model/RGB_PC_608x352.rknn" 
+#define PD_MODEL_RGB_TEST      "/root/model/RGB_PC_608x352.rknn"
+#define PALLET_CONFIG          "/root/config/PalletConfig.ini"
+
+/* pdsModel 的 0~17 已被 EPdsModel 使用；18 作为 SOURCE_ID=0 的光流栈板模式。 */
+#define PD_CONFIG_MODEL_BSD          ((sint32)E_PDS_PC)
+#define PD_CONFIG_MODEL_FLOW_PALLET  ((sint32)E_PDS_BUTT)
 
 #if !defined(BOARD_ADA32V3)
 #define PD_IMAGE_WIDTH      608                     /* 算法图像帧宽度 */
@@ -330,6 +337,7 @@ enum MPP_VDEC_H264RESOL_S{
 enum SONIX_CMD{
     CMD_RESET_IFRAME = 0,
     CMD_AREA_INFO ,
+    CMD_PALLET_INFO,
     CMD_AREA_COMFIRM ,
 };
 
@@ -345,6 +353,18 @@ uint8 BsdRange_TYPE = 0;
 
 uint8 alarm_out_flag = 0; //如果这个不为0，一段时间后减到0时把输出关掉
 uint8 alarm_out_lock = 0; //如果这个为1代表已经有触发输出
+
+static SV_BOOL g_bFlowPalletMode = SV_FALSE;
+static SV_BOOL g_bPalletParamsReady = SV_FALSE;
+static volatile SV_BOOL g_bRestartScheduled = SV_FALSE;
+
+static opticalflowanalyzeralg::STAlgParams g_stPalletDetectParams;
+static char g_acOFModelPath[128] = {0};
+static char g_acPalletModelPath[128] = {0};
+static opticalflowanalyzeralg::STAlgModelPath g_stOFModelsPath(g_acOFModelPath);
+static opticalflowanalyzeralg::STAlgModelPath g_stPalletModelsPath(g_acPalletModelPath);
+static opticalflowanalyzeralg::COpticalFlowAnalyzer g_cPalletAnalyzer(
+    opticalflowanalyzeralg::E_ALG_TYPE_PALLET_DETECT);
 
 
 
@@ -2862,6 +2882,7 @@ static uint16_t crc16_Gen(unsigned char *pu8Data, int u32Len)
 }
 
 
+#if 0
 int uart_receive()
 {
     sint32 s32Ret = 0;
@@ -3051,7 +3072,313 @@ int uart_receive()
            }
        }
     }
-    return SV_TRUE; 
+    return SV_TRUE;
+}
+#endif
+
+enum PD_MODEL_ACK_STATUS_E
+{
+    PD_MODEL_ACK_SAVED = 0,
+    PD_MODEL_ACK_NO_CHANGE,
+    PD_MODEL_ACK_INVALID_MODE,
+    PD_MODEL_ACK_CONFIG_ERROR,
+};
+
+static void pd_SetPalletAlarmRange(uint8_t u8RateRange)
+{
+    g_stPalletDetectParams.stAlarmRang.u32Range1 = 10 * u8RateRange;
+    g_stPalletDetectParams.stAlarmRang.u32Range2 = 20 * u8RateRange;
+    g_stPalletDetectParams.stAlarmRang.u32Range3 = 30 * u8RateRange;
+}
+
+static void pd_SendModelAck(uint8_t u8Mode, uint8_t u8Status)
+{
+    unsigned char au8Ack[8] = {0xff, 0xcc, 8, 0, u8Mode, u8Status, 0, 0};
+    uint16_t u16Crc = crc16_Gen(&au8Ack[2], sizeof(au8Ack) - 4);
+
+    au8Ack[6] = (uint8_t)(u16Crc & 0xff);
+    au8Ack[7] = (uint8_t)(u16Crc >> 8);
+    if (m_stPdInfo.s32SerialFd[0] > 0)
+    {
+        write(m_stPdInfo.s32SerialFd[0], au8Ack, sizeof(au8Ack));
+        tcdrain(m_stPdInfo.s32SerialFd[0]);
+    }
+}
+
+static void *pd_RestartAlgThread(void *pvArg)
+{
+    (void)pvArg;
+    sleep(1);
+    kill(getpid(), SIGKILL);
+    return NULL;
+}
+
+static void pd_ScheduleAlgRestart()
+{
+    pthread_t tid;
+
+    if (g_bRestartScheduled)
+    {
+        return;
+    }
+
+    g_bRestartScheduled = SV_TRUE;
+    if (pthread_create(&tid, NULL, pd_RestartAlgThread, NULL) == 0)
+    {
+        pthread_detach(tid);
+    }
+    else
+    {
+        print_level(SV_ERROR, "create alg restart thread failed.\n");
+        g_bRestartScheduled = SV_FALSE;
+    }
+}
+
+static uint8_t pd_PersistModelMode(uint8_t u8Mode)
+{
+    CFG_ALG_PARAM stAlgParam = {0};
+    sint32 s32DesiredModel;
+    sint32 s32Ret;
+
+    if (u8Mode == 0)
+    {
+        s32DesiredModel = PD_CONFIG_MODEL_BSD;
+    }
+    else if (u8Mode == 1)
+    {
+        s32DesiredModel = PD_CONFIG_MODEL_FLOW_PALLET;
+    }
+    else
+    {
+        return PD_MODEL_ACK_INVALID_MODE;
+    }
+
+    s32Ret = CONFIG_ReloadFile();
+    if (s32Ret != SV_SUCCESS)
+    {
+        print_level(SV_ERROR, "CONFIG_ReloadFile failed. [err=%#x]\n", s32Ret);
+        return PD_MODEL_ACK_CONFIG_ERROR;
+    }
+
+    s32Ret = CONFIG_GetAlgParam(&stAlgParam);
+    if (s32Ret != SV_SUCCESS)
+    {
+        print_level(SV_ERROR, "CONFIG_GetAlgParam failed. [err=%#x]\n", s32Ret);
+        return PD_MODEL_ACK_CONFIG_ERROR;
+    }
+
+    if ((sint32)stAlgParam.stAlgCh2.stPdsParam.enPdsModel == s32DesiredModel)
+    {
+        sint32 s32ActiveModel = g_bFlowPalletMode
+            ? PD_CONFIG_MODEL_FLOW_PALLET : PD_CONFIG_MODEL_BSD;
+        return s32ActiveModel == s32DesiredModel
+            ? PD_MODEL_ACK_NO_CHANGE : PD_MODEL_ACK_SAVED;
+    }
+
+    stAlgParam.stAlgCh2.stPdsParam.enPdsModel = (EPdsModel)s32DesiredModel;
+    s32Ret = CONFIG_SetAlgParam(&stAlgParam);
+    if (s32Ret != SV_SUCCESS)
+    {
+        print_level(SV_ERROR, "CONFIG_SetAlgParam failed. [err=%#x]\n", s32Ret);
+        return PD_MODEL_ACK_CONFIG_ERROR;
+    }
+
+    print_level(SV_INFO, "saved SOURCE_ID=0 model mode: %s(%d)\n",
+        u8Mode == 0 ? "BSD" : "FLOW_PALLET", s32DesiredModel);
+    return PD_MODEL_ACK_SAVED;
+}
+
+static void pd_HandleAreaFrame(const unsigned char *pu8Frame, uint8_t u8FrameLen)
+{
+    uint8_t u8Ch;
+
+    if (u8FrameLen < 22)
+    {
+        print_level(SV_WARN, "invalid area frame length:%u\n", u8FrameLen);
+        return;
+    }
+
+    u8Ch = pu8Frame[3];
+    if (u8Ch >= 4)
+    {
+        print_level(SV_WARN, "invalid area channel:%u\n", u8Ch);
+        return;
+    }
+
+    Area_Info_Get[u8Ch].line_top_x1 = (pu8Frame[5] << 8) + pu8Frame[4];
+    Area_Info_Get[u8Ch].line_top_x2 = (pu8Frame[7] << 8) + pu8Frame[6];
+    Area_Info_Get[u8Ch].line_bottom_x1 = (pu8Frame[9] << 8) + pu8Frame[8];
+    Area_Info_Get[u8Ch].line_bottom_x2 = (pu8Frame[11] << 8) + pu8Frame[10];
+    Area_Info_Get[u8Ch].line_top_y = (pu8Frame[13] << 8) + pu8Frame[12];
+    Area_Info_Get[u8Ch].line_bottom_y = (pu8Frame[19] << 8) + pu8Frame[18];
+    Area_Info_Get[u8Ch].line_second_y = Area_Info_Get[u8Ch].line_top_y
+        + (Area_Info_Get[u8Ch].line_bottom_y - Area_Info_Get[u8Ch].line_top_y)
+        * ((pu8Frame[15] << 8) + pu8Frame[14]) / 12;
+    Area_Info_Get[u8Ch].line_third_y = Area_Info_Get[u8Ch].line_top_y
+        + (Area_Info_Get[u8Ch].line_bottom_y - Area_Info_Get[u8Ch].line_top_y)
+        * ((pu8Frame[17] << 8) + pu8Frame[16]) / 12;
+    get_line_info(&Area_Info_Get[u8Ch]);
+    Area_Info_Get[u8Ch].recive_flag = 1;
+
+    print_level(SV_INFO, "received area info, channel:%u\n", u8Ch);
+}
+
+static void pd_HandlePalletFrame(const unsigned char *pu8Frame, uint8_t u8FrameLen)
+{
+    uint8_t u8Mode = 0;
+    uint8_t u8Status;
+    sint32 s32Ret;
+
+    if ((u8FrameLen != 14 && u8FrameLen != 15) || pu8Frame[3] != 0)
+    {
+        print_level(SV_WARN, "invalid pallet frame, length:%u channel:%u\n",
+            u8FrameLen, pu8Frame[3]);
+        return;
+    }
+
+    /* 旧版 14 字节和新版 15 字节报文共用栈板参数部分。 */
+    if (g_bPalletParamsReady)
+    {
+        g_stPalletDetectParams.u32CaliLine =
+            (uint32_t)(((float)((pu8Frame[5] << 8) + pu8Frame[4]) / 600.0f) * 352.0f);
+        g_stPalletDetectParams.u32TurnoffTime = pu8Frame[6];
+        g_stPalletDetectParams.u32FlowFrameInterval = pu8Frame[7];
+        pd_SetPalletAlarmRange(pu8Frame[8]);
+        g_stPalletDetectParams.fFLowPauseDuration = pu8Frame[9];
+        g_stPalletDetectParams.fFlowRunDuration = pu8Frame[10];
+        g_stPalletDetectParams.fPalletDetectSensity = (float)pu8Frame[11] / 100.0f;
+
+        s32Ret = g_cPalletAnalyzer.SaveParams(PALLET_CONFIG, g_stPalletDetectParams);
+        if (s32Ret != opticalflowanalyzeralg::E_ALG_SUCCESS)
+        {
+            print_level(SV_ERROR, "SaveParams failed. [err=%d]\n", s32Ret);
+            if (u8FrameLen == 15)
+            {
+                pd_SendModelAck(pu8Frame[12], PD_MODEL_ACK_CONFIG_ERROR);
+            }
+            return;
+        }
+    }
+
+    /* 旧报文只更新栈板参数，不改变运行模型。 */
+    if (u8FrameLen == 14)
+    {
+        return;
+    }
+
+    u8Mode = pu8Frame[12];
+    u8Status = pd_PersistModelMode(u8Mode);
+    pd_SendModelAck(u8Mode, u8Status);
+    if (u8Status == PD_MODEL_ACK_SAVED)
+    {
+        pd_ScheduleAlgRestart();
+    }
+}
+
+static void pd_ProcessSonixFrame(const unsigned char *pu8Frame, uint8_t u8FrameLen)
+{
+    uint16_t u16Crc;
+    uint16_t u16FrameCrc;
+
+    if (u8FrameLen < 6 || pu8Frame[2] != u8FrameLen)
+    {
+        return;
+    }
+
+    u16Crc = crc16_Gen((unsigned char *)&pu8Frame[2], u8FrameLen - 4);
+    u16FrameCrc = ((uint16_t)pu8Frame[u8FrameLen - 1] << 8)
+        | pu8Frame[u8FrameLen - 2];
+    if (u16Crc != u16FrameCrc)
+    {
+        print_level(SV_WARN, "Sonix frame CRC error: %#x != %#x\n", u16Crc, u16FrameCrc);
+        return;
+    }
+
+    if (pu8Frame[0] == 0xff && pu8Frame[1] == 0xbb)
+    {
+        pd_HandleAreaFrame(pu8Frame, u8FrameLen);
+    }
+    else if (pu8Frame[0] == 0xff && pu8Frame[1] == 0xcc)
+    {
+        pd_HandlePalletFrame(pu8Frame, u8FrameLen);
+    }
+}
+
+static void *uart_receive(void *pvArg)
+{
+    unsigned char au8ReadBuf[255] = {0};
+    unsigned char au8Frame[255] = {0};
+    size_t uFrameBytes = 0;
+    sint32 s32SerialFd = m_stPdInfo.s32SerialFd[0];
+
+    (void)pvArg;
+    while (1)
+    {
+        fd_set rfds;
+        sint32 s32Ret;
+        ssize_t s32ReadLen;
+
+        FD_ZERO(&rfds);
+        FD_SET(s32SerialFd, &rfds);
+        s32Ret = select(s32SerialFd + 1, &rfds, NULL, NULL, NULL);
+        if (s32Ret < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            print_level(SV_ERROR, "select serial failed. [err=%s]\n", strerror(errno));
+            sleep_ms(10);
+            continue;
+        }
+
+        s32ReadLen = read(s32SerialFd, au8ReadBuf, sizeof(au8ReadBuf));
+        if (s32ReadLen <= 0)
+        {
+            continue;
+        }
+
+        for (ssize_t i = 0; i < s32ReadLen; ++i)
+        {
+            unsigned char u8Byte = au8ReadBuf[i];
+
+            if (uFrameBytes == 0 && u8Byte != 0xff)
+            {
+                continue;
+            }
+
+            au8Frame[uFrameBytes++] = u8Byte;
+            if (uFrameBytes == 2)
+            {
+                if (au8Frame[1] == 0xdd)
+                {
+                    sendversion2sonix(0);
+                    uFrameBytes = 0;
+                    continue;
+                }
+                if (au8Frame[1] != 0xbb && au8Frame[1] != 0xcc)
+                {
+                    uFrameBytes = (u8Byte == 0xff) ? 1 : 0;
+                    continue;
+                }
+            }
+
+            if (uFrameBytes == 3 && au8Frame[2] < 6)
+            {
+                print_level(SV_WARN, "invalid Sonix frame length:%u\n", au8Frame[2]);
+                uFrameBytes = 0;
+                continue;
+            }
+
+            if (uFrameBytes >= 3 && uFrameBytes == au8Frame[2])
+            {
+                pd_ProcessSonixFrame(au8Frame, (uint8_t)uFrameBytes);
+                uFrameBytes = 0;
+            }
+        }
+    }
+
+    return NULL;
 }
 
 #endif
@@ -6088,6 +6415,10 @@ void * pd_alg_Body(void *pvArg)
     SV_BOOL bBlankClass = SV_FALSE;
     pdsa32::STPostParam stPostParam;
     stPostParam.stOverTakeParam.s32Delay = 5;
+    opticalflowanalyzeralg::STPalletDetectResult stPalletDetectResult;
+    uint8_t au8FlowAlarmLevel[50] = {0};
+    SV_BOOL bUseFlowPallet = SV_FALSE;
+    SV_BOOL bFlowLampSwitch = SV_FALSE;
 
     
 
@@ -6292,6 +6623,10 @@ void * pd_alg_Body(void *pvArg)
         }
 #endif
         memset(&stPdResult, 0x00, sizeof(pdsa32::STAlgInfo));
+        memset(&stPalletDetectResult, 0x00, sizeof(stPalletDetectResult));
+        memset(au8FlowAlarmLevel, 0x00, sizeof(au8FlowAlarmLevel));
+        bUseFlowPallet = SV_FALSE;
+        bFlowLampSwitch = SV_FALSE;
         memset(&stMediaGuiDraw, 0x00, sizeof(stMediaGuiDraw));
         memset(&stMcuPersonDis, 0x00, sizeof(stMcuPersonDis));
         memset(&stGuiRect, 0x00, sizeof(stGuiRect));
@@ -6438,6 +6773,11 @@ void * pd_alg_Body(void *pvArg)
              //sleep_ms(10);
             return current; //0;
         });
+        if (index < 0)
+        {
+            sleep_ms(1);
+            continue;
+        }
       //  memcpy( apvBuf00[index] , dstData[index], u32Width*u32Height*3);
 #endif
         // remove("./alg.rgb");
@@ -6451,19 +6791,78 @@ void * pd_alg_Body(void *pvArg)
 #else
        // SOURCE_ID =  *((uint8 *)apvBuf[s32CurChn]) ; //帧的第一个字节是source ID   
 
-        SOURCE_ID      =  dstData[index][RINGBUF_SIZE-extern_num]; 
+        SOURCE_ID      =  dstData[index][RINGBUF_SIZE-extern_num];
         DETECT_AREA_EN =  dstData[index][RINGBUF_SIZE-extern_num+1];
         DisplayMode    =  dstData[index][RINGBUF_SIZE-extern_num+2];
         DETECT_MODE    =  dstData[index][RINGBUF_SIZE-extern_num+3];
+        if (SOURCE_ID >= 4)
+        {
+            print_level(SV_WARN, "invalid SOURCE_ID:%u\n", SOURCE_ID);
+            ALG_Calculate_unLock();
+            continue;
+        }
         ALARM_OUTPUT_EN[SOURCE_ID] = dstData[index][RINGBUF_SIZE-extern_num+4];
         BsdRange_TYPE = dstData[index][RINGBUF_SIZE-extern_num+5];
 
-        s32Ret = apcsPdsAlg->AlgForward(dstData[index] , u32Width, u32Height, 0, 0);
+        bUseFlowPallet = (g_bFlowPalletMode && SOURCE_ID == 0) ? SV_TRUE : SV_FALSE;
+        if (bUseFlowPallet)
+        {
+            uint32_t u32OutNum = 0;
+
+            s32Ret = g_cPalletAnalyzer.PalletStateAnalysis(
+                (uint8_t *)dstData[index], stPalletDetectResult);
+            if (s32Ret == opticalflowanalyzeralg::E_ALG_SUCCESS)
+            {
+                bFlowLampSwitch = stPalletDetectResult.bLampSwitch ? SV_TRUE : SV_FALSE;
+                for (uint32_t u32In = 0;
+                     u32In < stPalletDetectResult.u32NumofObj && u32OutNum < 50;
+                     ++u32In)
+                {
+                    opticalflowanalyzeralg::STPalletDetectInfo *pstFlowInfo =
+                        &stPalletDetectResult.stPalletDetectInfo[u32In];
+                    pdsa32::STAlgResult *pstBsdInfo = &stPdResult.stResults[u32OutNum];
+
+                    switch (pstFlowInfo->cls)
+                    {
+                        case opticalflowanalyzeralg::E_CLS_PERSON:
+                            pstBsdInfo->classes = pdsa32::E_CLS_PERSON;
+                            break;
+                        case opticalflowanalyzeralg::E_CLS_CAR:
+                            pstBsdInfo->classes = pdsa32::E_CLS_CAR;
+                            break;
+                        case opticalflowanalyzeralg::E_CLS_PALLET:
+                            pstBsdInfo->classes = pdsa32::E_CLS_PALLET;
+                            break;
+                        default:
+                            continue;
+                    }
+
+                    pstBsdInfo->fX1 = pstFlowInfo->fX1;
+                    pstBsdInfo->fY1 = pstFlowInfo->fY1;
+                    pstBsdInfo->fX2 = pstFlowInfo->fX2;
+                    pstBsdInfo->fY2 = pstFlowInfo->fY2;
+                    pstBsdInfo->fConfidence = pstFlowInfo->fConfidence;
+                    au8FlowAlarmLevel[u32OutNum] = (uint8_t)pstFlowInfo->eAlarmLevel;
+                    ++u32OutNum;
+                }
+                stPdResult.u32Nums = u32OutNum;
+            }
+        }
+        else
+        {
+            s32Ret = apcsPdsAlg->AlgForward(dstData[index], u32Width, u32Height, 0, 0);
+            if (s32Ret == 0)
+            {
+                s32Ret = apcsPdsAlg->AlgResult(
+                    &stPdResult, pdsa32::E_POST_NONE, pstPdInfo->stTrackParam, s32CurChn);
+            }
+        }
 #endif
 
         if (0 != s32Ret)
         {
-            print_level(SV_ERROR, "ALGPDS_forward failed. [err=%d]\n", s32Ret);
+            print_level(SV_ERROR, "%s analysis failed. [err=%d]\n",
+                bUseFlowPallet ? "FLOW_PALLET" : "BSD", s32Ret);
 
 // #if 0
 //             pd_release_readIdx(s32CurChn, s32Idx);
@@ -6487,24 +6886,19 @@ void * pd_alg_Body(void *pvArg)
         //s32Cnt++;
         //print_level(SV_INFO, "framerate:%lf(fps)\n", 1.0 * s32Cnt / eclipse_time * 1000);
 
-        //apcsPdsAlg->AlgResult(&stPdResult, pdsa32::E_POST_TRACK, pstPdInfo->stTrackParam, s32CurChn);
-
-        apcsPdsAlg->AlgResult(&stPdResult, pdsa32::E_POST_NONE, pstPdInfo->stTrackParam, s32CurChn);
-
-        if (0 != s32Ret)
-        {
-            print_level(SV_ERROR, "AlgResult failed. [err=%d]\n", s32Ret);
-            sleep_ms(10);
-            continue;
-        }
-
        // MS_V(1);
 #if PD_OVERTAKE_ALARM
         // 行人靠近处理
-        apcsPdsAlg->AlgPostProcess(&stPdResult, pdsa32::E_POST_OVER_ALARM, stPostParam, s32CurChn);
+        if (!bUseFlowPallet)
+        {
+            apcsPdsAlg->AlgPostProcess(&stPdResult, pdsa32::E_POST_OVER_ALARM, stPostParam, s32CurChn);
+        }
 #endif
 
-        pd_RectAntiShakeFilter(&stPdResult, s32CurChn, 0.1, 0.2);
+        if (!bUseFlowPallet)
+        {
+            pd_RectAntiShakeFilter(&stPdResult, s32CurChn, 0.1, 0.2);
+        }
 
 
 
@@ -6545,7 +6939,7 @@ void * pd_alg_Body(void *pvArg)
         /* 将算法结果 stPdResult.u32Nums = 0 作为零发送 */
        //printf("detect num[%d]:%d ,%d\n",SOURCE_ID ,stPdResult.u32Nums ,u32cnt);
 skip_alg:  
-        for (i = 0; i < stPdResult.u32Nums; i++)
+        for (i = 0; i < stPdResult.u32Nums && u8LenAlgData < 50; i++)
         { 
 
              if(DETECT_MODE == 0)
@@ -6586,12 +6980,41 @@ skip_alg:
            stAlgResult[u8LenAlgData].x2 = (short)(stResults_f.fx2 * 1024);
            stAlgResult[u8LenAlgData].y2 = (short)(stResults_f.fy2 * 600);
 
-           // s32AlarmMode = area_detect(stAlgResult[i],Area_Info_Get[SOURCE_ID]); //获取报警程度
-           s32AlarmMode = area_detect(stAlgResult[i],Area_Info_Get[SOURCE_ID]);
+            if (bUseFlowPallet)
+            {
+                s32AlarmMode = au8FlowAlarmLevel[i];
+            }
+            else
+            {
+                s32AlarmMode = area_detect(stAlgResult[u8LenAlgData], Area_Info_Get[SOURCE_ID]);
+            }
 //            printf("alarm:%d\n",s32AlarmMode);
             stAlgResult[u8LenAlgData].alarm_type = (char)(s32AlarmMode&0x0F);
 
             coordinate_remap(&stAlgResult[u8LenAlgData],stResults_f,DisplayMode,1024,600);
+
+            if (bUseFlowPallet)
+            {
+                stAlgResult[u8LenAlgData].y1 +=
+                    (stAlgResult[u8LenAlgData].y2 - stAlgResult[u8LenAlgData].y1) / 2;
+                stAlgResult[u8LenAlgData].y2 = stAlgResult[u8LenAlgData].y1;
+            }
+
+            switch (s32AlarmMode)
+            {
+                case PD_ALARM_TYPE_RED:
+                    enRoi = PD_ROI_RED;
+                    break;
+                case PD_ALARM_TYPE_YELLOW:
+                    enRoi = PD_ROI_YELLOW;
+                    break;
+                case PD_ALARM_TYPE_GREEN:
+                    enRoi = PD_ROI_GREEN;
+                    break;
+                default:
+                    enRoi = PD_ROI_BUTT;
+                    break;
+            }
 
 
             if (stAlgResult[u8LenAlgData].x1 < 20)
@@ -6788,6 +7211,8 @@ sh: can't create /sys/class/gpio_stonkam/RGB/rgbstate: nonexistent directory****
             pc_flag += 1;
         if(u8car_cnt > 0)
             pc_flag += 2;
+        if (bUseFlowPallet && bFlowLampSwitch)
+            pc_flag |= 0x10;
 
         memcpy(&u8SerialData[3], &pc_flag, 1);
         //memcpy(&u8SerialData[4], &u8LenAlgData, 1);
@@ -7611,6 +8036,32 @@ sint32 PD_Init(PD_CFG_PARAM_S *pstInitParam)
 #endif
 
     pdsa32::STAlgParam stAlgParam(0.52, 0.45);              // 设置算法参数
+    EPdsModel enBsdModel = E_PDS_PC;
+
+    g_bFlowPalletMode = ((sint32)apstPdsParam[0]->enPdsModel
+        == PD_CONFIG_MODEL_FLOW_PALLET) ? SV_TRUE : SV_FALSE;
+    g_bPalletParamsReady = SV_FALSE;
+    g_bRestartScheduled = SV_FALSE;
+
+    print_level(SV_INFO, "SOURCE_ID=0 startup model: %s, pdsModel=%d\n",
+        g_bFlowPalletMode ? "FLOW_PALLET" : "BSD",
+        (sint32)apstPdsParam[0]->enPdsModel);
+
+    if (g_bFlowPalletMode)
+    {
+        g_stPalletDetectParams.stOpticalFlowModelPath = g_stOFModelsPath;
+        g_stPalletDetectParams.stPalletDetectModelPath = g_stPalletModelsPath;
+        s32Ret = g_cPalletAnalyzer.ImportParams(PALLET_CONFIG, g_stPalletDetectParams);
+        if (s32Ret != opticalflowanalyzeralg::E_ALG_SUCCESS)
+        {
+            print_level(SV_ERROR, "ImportParams failed. [err=%d]\n", s32Ret);
+            return SV_FAILURE;
+        }
+        g_bPalletParamsReady = SV_TRUE;
+        print_level(SV_INFO, "flow model:%s, pallet model:%s\n",
+            g_stPalletDetectParams.stOpticalFlowModelPath.pModelPath,
+            g_stPalletDetectParams.stPalletDetectModelPath.pModelPath);
+    }
 
     for (i = 0; i < m_stPdInfo.u32ChnNum; i++)
     {
@@ -7619,29 +8070,13 @@ sint32 PD_Init(PD_CFG_PARAM_S *pstInitParam)
             continue;
         }
         
-        apstPdsParam[i]->enPdsModel = pd_model_renew(apstPdsParam[i]->enPdsModel); // 由于模型合并,去除OW和NIR硬件类型
-
-        apstPdsParam[i]->enPdsModel = E_PDS_PC; //这里配置检测
-
-        switch (apstPdsParam[i]->enPdsModel)
-        {
-            case E_PDS_P:
-            case E_PDS_SH:
-            case E_PDS_IR_P:
-                m_stPdInfo.bSkipCar[i] = SV_TRUE;
-                break;
-            
-            case E_PDS_C:
-            case E_PDS_IR_C:
-                m_stPdInfo.bSkipPerson[i] = SV_TRUE;
-                break;
-            default:
-                break;
-        }
+        /* SOURCE_ID=1/2/3 始终需要 BSD，Flow 模式下也同时加载 BSD 模型。 */
+        m_stPdInfo.bSkipCar[i] = SV_FALSE;
+        m_stPdInfo.bSkipPerson[i] = SV_FALSE;
 
         /* 获取模型文件位置 */
         memset(pszModelFileList, 0x00, sizeof(pszModelFileList));
-        s32Ret = pd_model_file(apstPdsParam[i]->enPdsModel, pszModelFileList);
+        s32Ret = pd_model_file(enBsdModel, pszModelFileList);
         if(s32Ret != SV_SUCCESS)
         {
             print_level(SV_ERROR, "pd_model_file failed!\n");
@@ -7661,8 +8096,8 @@ sint32 PD_Init(PD_CFG_PARAM_S *pstInitParam)
             print_level(SV_ERROR, "getModelListMessage failed! [err=0x%x]\n", s32Ret);
         }
 
-        print_level(SV_INFO, "chn[%d] ready to load model[%d]\n", i, apstPdsParam[i]->enPdsModel);
-        switch (apstPdsParam[i]->enPdsModel)
+        print_level(SV_INFO, "chn[%d] ready to load BSD model[%d]\n", i, enBsdModel);
+        switch (enBsdModel)
         {
             case E_PDS_P:
                 if (BOARD_IsCustomer(BOARD_C_ADA32V2_200889) || BOARD_IsCustomer(BOARD_C_ADA32V2_201623))
@@ -7825,7 +8260,7 @@ toPcModel:
                 print_level(SV_ERROR, "invalid modelType[%d]=%d\n", i, apstPdsParam[i]->enPdsModel);
                 return SV_FAILURE;
         }
-        print_level(SV_INFO, "chn[%d] load model[%d] success!\n", i, apstPdsParam[i]->enPdsModel);
+        print_level(SV_INFO, "chn[%d] load BSD model[%d] success!\n", i, enBsdModel);
     }
 
 // #if (defined(BOARD_ADA32V2)|| defined(BOARD_ADA32C4))
@@ -7937,17 +8372,24 @@ skip_90:
  
 
     //pthread_attr_t  attr;
-    uint32 u32Tid_uartRead = 0;
+    pthread_t u32Tid_uartRead;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);       //设置为分离线程
     s32Ret = pthread_create(&u32Tid_uartRead, &attr, uart_receive,NULL);
-    
+    pthread_attr_destroy(&attr);
 
     //request_threaded_irq();
 
-    if (SV_TRUE == s32Ret)
+    if (0 != s32Ret)
     {
-        printf( "serial_init SUCCESS!\n");
+        print_level(SV_ERROR, "create uart_receive thread failed. [err=%d]\n", s32Ret);
+        return SV_FAILURE;
+    }
+
+    printf("serial_init SUCCESS!\n");
+    if (g_bFlowPalletMode)
+    {
+        sendcmd2sonix(0, 0, CMD_PALLET_INFO);
     }
 
     return SV_SUCCESS;
